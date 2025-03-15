@@ -81,22 +81,37 @@ class ModbusNode(Node):
             # open red led color + Buzzer on start node
             red_addr = 0x004
             buzzer_addr = 0x005
-            init_color_value = 0x002
-            init_buzzer_value = 0x002
+            red_value = 0x002
+            buzzer_value = 0x002
 
-            red_response = self.client.write_register(red_addr, init_color_value, slave=slave_id)
-            buzzer_response = self.client.write_register(
-                buzzer_addr, init_buzzer_value, slave=slave_id)
+            # red_response = self.client.write_register(red_addr, red_value, slave=slave_id)
+            # buzzer_response = self.client.write_register(
+            #     buzzer_addr, buzzer_value, slave=slave_id)
 
-            if red_response.isError():
-                self.get_logger().error(f"❌ Failed to set Red LED at {red_addr:#05x}")
-            else:
-                self.get_logger().info(f"✅ Red LED turned on at {red_addr:#05x}")
+            self.client.write_register(red_addr, red_value, slave=slave_id)
+            self.client.write_register(buzzer_addr, buzzer_value, slave=slave_id)
+            self.get_logger().info("✅ Red LED and Buzzer turned on.")
 
-            if buzzer_response.isError():
-                self.get_logger().error("❌ Failed to turn on Buzzer at 0x005")
-            else:
-                self.get_logger().info("✅ Buzzer turned on at 0x005")
+            time.sleep(5)  # wait 5 seconds
+
+            green_addr = 0x002
+            self.client.write_register(red_addr, 0x000, slave=slave_id)  # ปิดไฟสีแดง
+            self.client.write_register(green_addr, red_value, slave=slave_id)  # เปิดไฟสีเขียว
+            self.client.write_register(
+                buzzer_addr,
+                buzzer_value,
+                slave=slave_id)  # เปิด Buzzer อีกครั้ง
+            self.get_logger().info("✅ Green LED and Buzzer turned on.")
+
+            # if red_response.isError():
+            #     self.get_logger().error(f"❌ Failed to set Red LED at {red_addr:#05x}")
+            # else:
+            #     self.get_logger().info(f"✅ Red LED turned on at {red_addr:#05x}")
+
+            # if buzzer_response.isError():
+            #     self.get_logger().error("❌ Failed to turn on Buzzer at 0x005")
+            # else:
+            #     self.get_logger().info("✅ Buzzer turned on at 0x005")
 
         else:
             self.get_logger().error("❌ Failed to connect")
@@ -123,27 +138,52 @@ class ModbusNode(Node):
             self.connected = True
 
             # Turn on the red light + turn on the Buzzer immediately after successful connection.
+
             red_addr = 0x004
             buzzer_addr = 0x005
-            color_value = 0x002
+            red_value = 0x002
             buzzer_value = 0x002
+            slave_id = 1
 
-            time.sleep(2)
+            # red_response = self.client.write_register(red_addr, red_value, slave=slave_id)
+            # buzzer_response = self.client.write_register(
+            #     buzzer_addr, buzzer_value, slave=slave_id)
 
-            red_response = self.client.write_register(red_addr, color_value, slave=1)
-            buzzer_response = self.client.write_register(buzzer_addr, buzzer_value, slave=1)
+            self.client.write_register(red_addr, red_value, slave=slave_id)
+            self.client.write_register(buzzer_addr, buzzer_value, slave=slave_id)
+            self.get_logger().info("✅ Red LED and Buzzer turned on.")
 
-            if red_response.isError():
-                self.get_logger().error(f"❌ Failed to set Red LED at {red_addr:#05x}")
-            else:
-                self.get_logger().info(f"✅ Red LED turned on at {red_addr:#05x}")
+            time.sleep(5)  # wait 5 seconds
 
-            if buzzer_response.isError():
-                self.get_logger().error("❌ Failed to turn on Buzzer at 0x005")
-            else:
-                self.get_logger().info("✅ Buzzer turned on at 0x005")
+            green_addr = 0x002
+            self.client.write_register(red_addr, 0x000, slave=slave_id)  # ปิดไฟสีแดง
+            self.client.write_register(green_addr, red_value, slave=slave_id)  # เปิดไฟสีเขียว
+            self.client.write_register(
+                buzzer_addr,
+                buzzer_value,
+                slave=slave_id)  # เปิด Buzzer อีกครั้ง
+            self.get_logger().info("✅ Green LED and Buzzer turned on.")
+
+            # if red_response.isError():
+            #     self.get_logger().error(f"❌ Failed to set Red LED at {red_addr:#05x}")
+            # else:
+            #     self.get_logger().info(f"✅ Red LED turned on at {red_addr:#05x}")
+
+            # if buzzer_response.isError():
+            #     self.get_logger().error("❌ Failed to turn on Buzzer at 0x005")
+            # else:
+            #     self.get_logger().info("✅ Buzzer turned on at 0x005")
+
         else:
-            self.get_logger().warn("⚠️ Reconnection failed, retrying in 5 seconds . . .")
+            self.get_logger().error("❌ Failed to connect")
+            return
+
+        if not self.client.connect():
+            self.get_logger().error("❌ Failed to connect to Tower Light!")
+            self.connected = False
+        else:
+            self.get_logger().info("✅ Connected to Modbus device")
+            self.connected = True
 
     def read_modbus_data(self):
         """ Read values from Tower Light and check status """
