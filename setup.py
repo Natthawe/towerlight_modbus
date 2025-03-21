@@ -24,6 +24,9 @@ setup(
     entry_points={
         'console_scripts': [
             'towerlight_modbus_node = towerlight_modbus.towerlight_modbus_node:main',
+            'optimize_towerlight_node = towerlight_modbus.optimize_towerlight_node:main',
+            'emergency_towerlight_node = towerlight_modbus.emergency_towerlight_node:main',
+            'emer_and_towerlight_node = towerlight_modbus.emer_and_towerlight_node:main',
         ],
     },
 )

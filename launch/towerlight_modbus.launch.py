@@ -6,8 +6,9 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='towerlight_modbus',
-            executable='towerlight_modbus_node',
-            name='towerlight_modbus_node',
+            executable='optimize_towerlight_node',
+            name='optimize_towerlight_node',
             output='screen',
+            respawn=True,
         ),
     ])

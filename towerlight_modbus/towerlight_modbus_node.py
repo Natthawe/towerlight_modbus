@@ -16,7 +16,7 @@ class ModbusNode(Node):
 
         # Create Client for connection Modbus
         self.client = ModbusSerialClient(
-            port='/dev/ttyUSB0',
+            port='/dev/towerlight',
             baudrate=9600,
             parity='N',
             stopbits=1,
@@ -33,7 +33,7 @@ class ModbusNode(Node):
         # Subscribe to topic repeat_topic
         self.subscription = self.create_subscription(
             Int32,
-            'repeat_topic',
+            'monitor_topic',
             self.listener_callback,
             10
         )
@@ -284,15 +284,25 @@ class ModbusNode(Node):
         # Turn off the lights and buzzer first.
         self.clear_all()
 
+        time.sleep(1)
+
         # Control LED and Buzzer according to received values
         if value == 1:
+            time.sleep(0.5)
             write_color_and_buzzer(green_addr, color_values, buzzer_values)
+            time.sleep(0.5)
         elif value == 2:
+            time.sleep(0.5)
             write_color_and_buzzer(yellow_addr, color_values, buzzer_values)
+            time.sleep(0.5)
         elif value == 3:
+            time.sleep(0.5)
             write_color_and_buzzer(red_addr, color_values, buzzer_values)
+            time.sleep(0.5)
         elif value == 0:
+            time.sleep(0.5)
             self.clear_all()
+            time.sleep(0.5)
 
 
 def main(args=None):
