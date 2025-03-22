@@ -12,7 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,6 +27,7 @@ setup(
             'optimize_towerlight_node = towerlight_modbus.optimize_towerlight_node:main',
             'emergency_towerlight_node = towerlight_modbus.emergency_towerlight_node:main',
             'emer_and_towerlight_node = towerlight_modbus.emer_and_towerlight_node:main',
+            'final_emergency_towerlight_node = towerlight_modbus.final_emergency_towerlight_node:main',
         ],
     },
 )
