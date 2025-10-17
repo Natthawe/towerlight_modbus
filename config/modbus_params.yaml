@@ -6,7 +6,7 @@ final_emergency_towerlight_node:
     parity: "N"               # "N", "E", "O"
     stopbits: 1
     bytesize: 8
-    timeout: 1.0
+    timeout: 2.0
     slave_id: 1
 
     # ===== Timers =====
@@ -16,11 +16,11 @@ final_emergency_towerlight_node:
     emergency_auto_trigger_delay: 0.0  # 0.0 = ปิด auto-emergency
 
     # ===== Buzzer Policy =====
-    enable_buzzer: true
-    buzzer_on_red: true
+    enable_buzzer: false
+    buzzer_on_red: false
     buzzer_on_yellow: false
     buzzer_on_green: false
-    buzzer_on_emergency: true
+    buzzer_on_emergency: false
 
-    emergency_buzzer_pulse_ms: 150   # 0 = ไม่เปิด buzzer เลยตอนฉุกเฉิน
+    emergency_buzzer_pulse_ms: 0   # 0 = ไม่เปิด buzzer เลยตอนฉุกเฉิน
     force_clear_before_green: true

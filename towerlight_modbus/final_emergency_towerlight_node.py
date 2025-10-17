@@ -272,9 +272,9 @@ class ModbusNode(Node):
 
     # ---------- topics ----------
     def listener_callback(self, msg: Int32):
-        self.get_logger().info(f"RX /monitor_topic: {msg.data} (emergency={self.emergency_active})")
+        # self.get_logger().info(f"RX /monitor_topic: {msg.data} (emergency={self.emergency_active})")
         if self.emergency_active:
-            self.get_logger().info("ignore because emergency active")
+            # self.get_logger().info("ignore because emergency active")
             return
         v = int(msg.data)
         if   v == 1: self._set_green(record=True)
@@ -286,9 +286,9 @@ class ModbusNode(Node):
 
     def emergency_callback(self, msg: Bool):
         new_state = bool(msg.data)
-        self.get_logger().info(f"RX /emergency_stop: {new_state}")
+        # self.get_logger().info(f"RX /emergency_stop: {new_state}")
         if new_state == self.emergency_active:
-            self.get_logger().info("no change")
+            # self.get_logger().info("no change")
             return
 
         self.emergency_active = new_state
