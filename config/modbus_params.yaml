@@ -1,4 +1,4 @@
-modbus_node:
+final_emergency_towerlight_node:
   ros__parameters:
     # ===== Serial =====
     port: "/dev/towerlight"   # เช่น "/dev/ttyUSB0"
@@ -10,7 +10,7 @@ modbus_node:
     slave_id: 1
 
     # ===== Timers =====
-    poll_period: 3.0                 # อ่าน holding registers ทุกกี่วิ
+    poll_period: 5.0                 # อ่าน holding registers ทุกกี่วิ
     reconnect_period: 2.0            # ความถี่พยายามเชื่อมต่อใหม่
     turn_green_delay: 0.0            # หลังบูต(ขึ้นไฟแดง) รอกี่วิค่อยเปิดไฟเขียว
     emergency_auto_trigger_delay: 0.0  # 0.0 = ปิด auto-emergency
@@ -21,3 +21,6 @@ modbus_node:
     buzzer_on_yellow: false
     buzzer_on_green: false
     buzzer_on_emergency: true
+
+    emergency_buzzer_pulse_ms: 150   # 0 = ไม่เปิด buzzer เลยตอนฉุกเฉิน
+    force_clear_before_green: true
