@@ -6,14 +6,14 @@ Towerlight Modbus Node (ROS 2) — Serial RTU only
 - รองรับ pymodbus 3.8.x (ไม่มี method='rtu')
 - ตรวจอัตโนมัติว่าใช้ kw 'slave' หรือ 'unit'
 - Non-blocking (ไม่มี time.sleep ใน callback)
-- Reconnect อัตโนมัติ + restore ค่าล่าสุดเมื่อกลับมา
-- Verbose log เห็นเหตุการณ์ทั้งหมด
+- Reconnect อัตโนมัติ + restore ค่าสีเดิม
+- แก้บั๊ก: ปลดฉุกเฉินแล้วคืนสีเดิมก่อนเข้า EMERGENCY
 """
 
 import threading
 import logging
 import inspect
-from typing import Optional, Any
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -38,7 +38,7 @@ VAL_OFF    = 0x000
 
 class ModbusNode(Node):
     def __init__(self):
-        super().__init__('towerlight_serial_node')
+        super().__init__('final_emergency_towerlight_node')
         self.cb = ReentrantCallbackGroup()
 
         # ===== parameters =====
@@ -89,7 +89,6 @@ class ModbusNode(Node):
                 stopbits=self.stopbits, bytesize=self.bytesize, timeout=self.timeout
             )
         except TypeError:
-            # เส้นทางหลักสำหรับ 3.8.x
             self.client = ModbusSerialClient(
                 port=self.port, baudrate=self.baudrate, parity=self.parity,
                 stopbits=self.stopbits, bytesize=self.bytesize, timeout=self.timeout
@@ -103,6 +102,7 @@ class ModbusNode(Node):
 
         # ===== state =====
         self.emergency_active = False
+        self.pre_emergency_value: Optional[int] = None  # จำค่าสีก่อนเข้า EMERGENCY
         self.last_cmd_value = 0      # 0=all off, 1=green, 2=yellow, 3=red
         self.pending_timers = []     # one-shot timers (ยกเลิกตอน emergency)
 
@@ -117,7 +117,7 @@ class ModbusNode(Node):
         # Boot sequence
         self._ensure_connection(first_time=True)
         if self.turn_green_delay > 0.0:
-            self._set_red(buzzer=self.buzz_red)
+            self._set_red(buzzer=self.buzz_red, record=True)
             self._arm_timer(self.turn_green_delay, self._set_green)
         else:
             self._set_green()
@@ -134,7 +134,6 @@ class ModbusNode(Node):
             return 'slave'
         if 'unit' in sig.parameters:
             return 'unit'
-        # ค่าเริ่มต้นปลอดภัยในรุ่นใหม่ ๆ
         return 'unit'
 
     def _call_write(self, addr: int, val: int):
@@ -162,7 +161,6 @@ class ModbusNode(Node):
                 return False
 
     def _enable_rtu(self) -> bool:
-        # บางอุปกรณ์ต้อง enable ก่อน
         return self._write_reg(REG_ENABLE, 0x001)
 
     def _all_off(self) -> None:
@@ -176,22 +174,26 @@ class ModbusNode(Node):
         if self.enable_buzzer:
             self._write_reg(REG_BUZZ, VAL_ON if want else VAL_OFF)
 
-    def _set_green(self) -> None:
-        self.last_cmd_value = 1
+    # --- ตั้งสี (มี flag record เพื่อไม่ทับ last_cmd ตอน EMERGENCY) ---
+    def _set_green(self, record: bool = True) -> None:
+        if record:
+            self.last_cmd_value = 1
         self.get_logger().info("SET GREEN")
         self._all_off()
         self._write_reg(REG_GREEN, VAL_ON)
         self._apply_buzzer(self.buzz_green and not self.emergency_active)
 
-    def _set_yellow(self) -> None:
-        self.last_cmd_value = 2
+    def _set_yellow(self, record: bool = True) -> None:
+        if record:
+            self.last_cmd_value = 2
         self.get_logger().info("SET YELLOW")
         self._all_off()
         self._write_reg(REG_YELLOW, VAL_ON)
         self._apply_buzzer(self.buzz_yellow and not self.emergency_active)
 
-    def _set_red(self, buzzer: Optional[bool] = None) -> None:
-        self.last_cmd_value = 3
+    def _set_red(self, buzzer: Optional[bool] = None, record: bool = True) -> None:
+        if record:
+            self.last_cmd_value = 3
         self.get_logger().info("SET RED")
         self._all_off()
         self._write_reg(REG_RED, VAL_ON)
@@ -262,9 +264,9 @@ class ModbusNode(Node):
             self.get_logger().info("ignore because emergency active")
             return
         v = int(msg.data)
-        if   v == 1: self._set_green()
-        elif v == 2: self._set_yellow()
-        elif v == 3: self._set_red()
+        if   v == 1: self._set_green(record=True)
+        elif v == 2: self._set_yellow(record=True)
+        elif v == 3: self._set_red(record=True)
         else:
             self.last_cmd_value = 0
             self._all_off()
@@ -280,11 +282,18 @@ class ModbusNode(Node):
         self._cancel_all_one_shots()
 
         if self.emergency_active:
+            self.pre_emergency_value = self.last_cmd_value
             self.get_logger().error("🛑 EMERGENCY ACTIVATED!")
-            self._set_red(buzzer=self.buzz_on_emergency)
+            self._set_red(buzzer=self.buzz_on_emergency, record=False)
         else:
             self.get_logger().info("✅ EMERGENCY DEACTIVATED")
-            self._restore_last()
+            v = self.pre_emergency_value
+            self.pre_emergency_value = None
+            if   v == 1: self._set_green(record=True)
+            elif v == 2: self._set_yellow(record=True)
+            elif v == 3: self._set_red(record=True)
+            else:        self._set_green(record=True)
+            # self._set_green(record=True)
 
     # ---------- shutdown ----------
     def destroy_node(self):
