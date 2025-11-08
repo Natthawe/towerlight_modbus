@@ -27,3 +27,4 @@ final_emergency_towerlight_node:
     # ===== Write Behavior =====
     force_clear_before_green: true   # ปลดฉุกเฉินแล้วเคลียร์ทุกรีจิสเตอร์ก่อนเปิดเขียว
     force_block_write: true          # เขียน 0x002..0x005 ทีเดียว เร็วและนิ่ง
+    force_clear_before_red: true     # ก่อนเปลี่ยนเป็นแดง เคลียร์รีจิสเตอร์ก่อน
