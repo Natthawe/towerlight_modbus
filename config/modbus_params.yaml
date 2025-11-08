@@ -21,5 +21,3 @@ modbus_node:
     buzzer_on_yellow: false
     buzzer_on_green: false
     buzzer_on_emergency: true
-
-    transport: "serial"         # "fake" | "serial" | "tcp"
