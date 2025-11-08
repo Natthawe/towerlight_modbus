@@ -6,12 +6,12 @@ modbus_node:
     parity: "N"               # "N", "E", "O"
     stopbits: 1
     bytesize: 8
-    timeout: 2.0
+    timeout: 1.0
     slave_id: 1
 
     # ===== Timers =====
     poll_period: 3.0                 # อ่าน holding registers ทุกกี่วิ
-    reconnect_period: 3.0            # ความถี่พยายามเชื่อมต่อใหม่
+    reconnect_period: 2.0            # ความถี่พยายามเชื่อมต่อใหม่
     turn_green_delay: 0.0            # หลังบูต(ขึ้นไฟแดง) รอกี่วิค่อยเปิดไฟเขียว
     emergency_auto_trigger_delay: 0.0  # 0.0 = ปิด auto-emergency
 

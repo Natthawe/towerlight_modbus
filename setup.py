@@ -21,7 +21,7 @@ setup(
     maintainer_email='natthawejumjai@gmail.com',
     description='A package that controls the tower light using Modbus',
     license='Apache-2.0',
-    tests_require=['pytest'],
+    # tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'towerlight_modbus_node = towerlight_modbus.towerlight_modbus_node:main',
@@ -30,6 +30,7 @@ setup(
             'emer_and_towerlight_node = towerlight_modbus.emer_and_towerlight_node:main',
             'final_emergency_towerlight_node = towerlight_modbus.final_emergency_towerlight_node:main',
             'modbus_node = towerlight_modbus.modbus_node:main',
+            'fake_node = towerlight_modbus.fake_node:main',
         ],
     },
 )

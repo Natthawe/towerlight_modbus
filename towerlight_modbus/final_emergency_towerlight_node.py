@@ -1,240 +1,271 @@
+#!/usr/bin/env python3
+import threading
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Int32, Bool
 from pymodbus.client import ModbusSerialClient
-from pymodbus.exceptions import ModbusIOException, ConnectionException
+from pymodbus.exceptions import ModbusIOException
 import logging
-import time
-import atexit
-from rclpy.timer import Timer
 
 logging.getLogger('pymodbus').setLevel(logging.CRITICAL)
+
+REG_GREEN  = 0x002
+REG_YELLOW = 0x003
+REG_RED    = 0x004
+REG_BUZZ   = 0x005
+REG_ENABLE = 0x006
+VAL_ON     = 0x002
+VAL_OFF    = 0x000
 
 
 class ModbusNode(Node):
     def __init__(self):
-        super().__init__('modbus_node')
+        super().__init__('towerlight_serial_node')
+        self.cb = ReentrantCallbackGroup()
 
+        # ===== params =====
+        self.declare_parameter('port', '/dev/towerlight')
+        self.declare_parameter('baudrate', 9600)
+        self.declare_parameter('parity', 'N')   # 'N','E','O'
+        self.declare_parameter('stopbits', 1)   # 1 or 2
+        self.declare_parameter('bytesize', 8)   # 7 or 8
+        self.declare_parameter('timeout',  0.3) # seconds
+        self.declare_parameter('slave_id', 1)
+
+        self.declare_parameter('poll_period', 3.0)
+        self.declare_parameter('reconnect_period', 2.0)
+        self.declare_parameter('turn_green_delay', 0.0)
+        self.declare_parameter('emergency_auto_trigger_delay', 0.0)
+
+        self.declare_parameter('enable_buzzer', True)
+        self.declare_parameter('buzzer_on_red', True)
+        self.declare_parameter('buzzer_on_yellow', False)
+        self.declare_parameter('buzzer_on_green', False)
+        self.declare_parameter('buzzer_on_emergency', True)
+
+        p = self.get_parameter
+        self.port       = p('port').value
+        self.baudrate   = int(p('baudrate').value)
+        self.parity     = p('parity').value
+        self.stopbits   = int(p('stopbits').value)
+        self.bytesize   = int(p('bytesize').value)
+        self.timeout    = float(p('timeout').value)
+        self.slave      = int(p('slave_id').value)
+
+        self.poll_period      = float(p('poll_period').value)
+        self.reconnect_period = float(p('reconnect_period').value)
+        self.turn_green_delay = float(p('turn_green_delay').value)
+        self.auto_emerg_delay = float(p('emergency_auto_trigger_delay').value)
+
+        self.enable_buzzer     = bool(p('enable_buzzer').value)
+        self.buzz_red          = bool(p('buzzer_on_red').value)
+        self.buzz_yellow       = bool(p('buzzer_on_yellow').value)
+        self.buzz_green        = bool(p('buzzer_on_green').value)
+        self.buzz_on_emergency = bool(p('buzzer_on_emergency').value)
+
+        # ===== comm (Serial RTU) =====
         self.client = ModbusSerialClient(
-            port='/dev/towerlight', baudrate=9600, parity='N', stopbits=1, bytesize=8, timeout=2
+            method='rtu',
+            port=self.port,
+            baudrate=self.baudrate,
+            parity=self.parity,
+            stopbits=self.stopbits,
+            bytesize=self.bytesize,
+            timeout=self.timeout
         )
-        self.connected = self.client.connect()
+        self.modbus_lock = threading.Lock()
+        self.connected = False
 
-        if self.connected:
-            self.enable_modbus_rtu()
-            self.timer = self.create_timer(150.0, self.turn_green)
-            self.set_light(0x004, 0x002, 1)  # เปิดไฟแดง
+        # ===== state =====
+        self.emergency_active = False
+        self.last_cmd_value = 0      # 0=all off, 1=green, 2=yellow, 3=red
+        self.pending_timers = []     # one-shot timers to cancel on emergency
+
+        # ===== topics =====
+        self.create_subscription(Int32, 'monitor_topic', self.listener_callback, 10, callback_group=self.cb)
+        self.create_subscription(Bool,  'emergency_stop', self.emergency_callback, 10, callback_group=self.cb)
+
+        # ===== timers =====
+        self.create_timer(self.reconnect_period, self._ensure_connection, callback_group=self.cb)
+        self.create_timer(self.poll_period, self._poll_registers, callback_group=self.cb)
+
+        # Boot sequence: connect -> green (or red then green after delay)
+        self._ensure_connection(first_time=True)
+        if self.turn_green_delay > 0.0:
+            self._set_red(buzzer=self.buzz_red)
+            self._arm_timer(self.turn_green_delay, self._set_green)
         else:
-            self.get_logger().error("❌ Failed to connect to Modbus device")
+            self._set_green()
 
-        self.reconnect_timer = self.create_timer(3.0, self.reconnect)
-        self.read_data_timer = self.create_timer(3.0, self.read_modbus_data)
-        self.timer_emergency_check = None  # Initialize the timer
+        if self.auto_emerg_delay > 0.0:
+            self._arm_timer(self.auto_emerg_delay, lambda: self.emergency_callback(Bool(data=True)))
 
-        atexit.register(self.clear_all)
+        self.get_logger().info("✅ Towerlight serial node started")
 
-        self.emergency_active = True
-
-        self.timer_triggered = False
-
-        self.get_logger().info(f"Emergency State: {self.emergency_active}")
-
-    def enable_modbus_rtu(self):
-        """Enable MODBUS RTU communication"""
-        enable_address, enable_value, slave_id = 0x006, 0x001, 1
-
-        while True:
+    # ---------- low level helpers (non-blocking) ----------
+    def _write_reg(self, addr, val):
+        if not self.connected:
+            self.get_logger().warn(f"skip write 0x{addr:03X} (not connected)")
+            return False
+        with self.modbus_lock:
             try:
-                response = self.client.write_register(enable_address, enable_value, slave=slave_id)
-                if response.isError():
-                    self.get_logger().error("❌ Failed to enable MODBUS RTU")
-                    time.sleep(1)
-                else:
-                    self.get_logger().info("✅ Tower Light is connected!")
-                    self.get_logger().info("✅ MODBUS RTU enabled")
-                    break
-            except (ModbusIOException, ConnectionException) as e:
-                self.get_logger().error(f"❌ Connection Error: {e}")
-                time.sleep(1)
-        time.sleep(2)
+                resp = self.client.write_register(addr, val, slave=self.slave)
+                ok = (resp is not None) and (not resp.isError())
+                self.get_logger().info(f"WRITE 0x{addr:03X} = {val} -> {'OK' if ok else 'ERR'}")
+                return ok
+            except Exception as e:
+                self.get_logger().error(f"Modbus write error @0x{addr:03X}: {e}")
+                self.connected = False
+                return False
 
-    def reconnect(self):
-        """Attempt to reconnect if disconnected"""
+    def _enable_rtu(self):
+        # บางอุปกรณ์ต้อง enable ก่อนใช้งาน
+        return self._write_reg(REG_ENABLE, 0x001)
+
+    def _all_off(self):
+        self.get_logger().info("ALL OFF")
+        self._write_reg(REG_GREEN,  VAL_OFF)
+        self._write_reg(REG_YELLOW, VAL_OFF)
+        self._write_reg(REG_RED,    VAL_OFF)
+        self._write_reg(REG_BUZZ,   VAL_OFF)
+
+    def _apply_buzzer(self, want):
+        if self.enable_buzzer:
+            self._write_reg(REG_BUZZ, VAL_ON if want else VAL_OFF)
+
+    def _set_green(self):
+        self.last_cmd_value = 1
+        self.get_logger().info("SET GREEN")
+        self._all_off()
+        self._write_reg(REG_GREEN, VAL_ON)
+        self._apply_buzzer(self.buzz_green and not self.emergency_active)
+
+    def _set_yellow(self):
+        self.last_cmd_value = 2
+        self.get_logger().info("SET YELLOW")
+        self._all_off()
+        self._write_reg(REG_YELLOW, VAL_ON)
+        self._apply_buzzer(self.buzz_yellow and not self.emergency_active)
+
+    def _set_red(self, buzzer=None):
+        self.last_cmd_value = 3
+        self.get_logger().info("SET RED")
+        self._all_off()
+        self._write_reg(REG_RED, VAL_ON)
+        if buzzer is None:
+            buzzer = self.buzz_red and not self.emergency_active
+        self._apply_buzzer(buzzer)
+
+    def _restore_last(self):
+        self.get_logger().info(f"RESTORE last={self.last_cmd_value}")
+        {0: self._all_off, 1: self._set_green, 2: self._set_yellow, 3: self._set_red}.get(self.last_cmd_value, self._all_off)()
+
+    def _arm_timer(self, delay_sec, fn):
+        t = self.create_timer(delay_sec, lambda: self._fire_one_shot(t, fn), callback_group=self.cb)
+        self.pending_timers.append(t)
+
+    def _fire_one_shot(self, timer_obj, fn):
+        try:
+            fn()
+        finally:
+            try:
+                timer_obj.cancel()
+            except Exception:
+                pass
+            if timer_obj in self.pending_timers:
+                self.pending_timers.remove(timer_obj)
+
+    def _cancel_all_one_shots(self):
+        for t in list(self.pending_timers):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self.pending_timers.clear()
+
+    # ---------- connection / polling ----------
+    def _ensure_connection(self, first_time=False):
         if self.connected:
             return
-
-        self.get_logger().info("🔄 Attempting to reconnect...")
         try:
             self.client.close()
-            self.connected = self.client.connect()
-            if self.connected:
-                self.get_logger().info("✅ Reconnecting to Modbus device...")
-                self.enable_modbus_rtu()
-                self.set_light(0x004, 0x002, 1)  # เปิดไฟแดง
-                time.sleep(160)
-                self.set_light(0x004, 0x000, 1)  # ปิดไฟแดง
-                time.sleep(0.5)
-                self.set_light(0x002, 0x002, 1)  # เปิดไฟเขียว
-                self.read_data_timer.cancel()  # ยกเลิก timer ก่อนหน้า
-                self.read_data_timer = self.create_timer(
-                    3.0, self.read_modbus_data)  # สร้าง timer ใหม่
-            else:
-                self.get_logger().error("❌ Reconnection failed")
-        except Exception as e:
-            self.get_logger().error(f"❌ Reconnection attempt failed: {e}")
-            self.connected = False
+        except Exception:
+            pass
+        self.connected = self.client.connect()
+        self.get_logger().info(f"CONNECT -> {'OK' if self.connected else 'FAIL'} (port={self.port}, baud={self.baudrate})")
+        if self.connected:
+            if not self._enable_rtu():
+                self.get_logger().warn("⚠️ enable RTU failed (will keep trying on writes)")
+            self._restore_last()
+        elif first_time:
+            self.get_logger().error("❌ Failed to connect to Modbus device (will retry)")
 
-    def read_modbus_data(self):
-        """Read and log Modbus data if connected"""
+    def _poll_registers(self):
         if not self.connected:
-            self.get_logger().warn("⚠️ Tower Light is disconnected!")
             return
-
         try:
-            response = self.client.read_holding_registers(address=0x000, count=10, slave=1)
-            if response.isError():
-                raise ModbusIOException("Modbus response error")
-        except (ModbusIOException, ConnectionException) as e:
-            self.get_logger().error(f"❌ Modbus Error: {e}")
-            self.connected = False
-            self.reconnect()
+            with self.modbus_lock:
+                resp = self.client.read_holding_registers(address=0x000, count=4, slave=self.slave)
+            if not resp or resp.isError():
+                raise ModbusIOException("read error")
         except Exception as e:
-            self.get_logger().error(f"❌ Unexpected Error: {e}")
+            self.get_logger().warn(f"Modbus poll failed: {e}")
             self.connected = False
-            self.reconnect()
 
-    def turn_green(self):
-        """The light turns green after 60 seconds."""
-        self.set_light(0x004, 0x000, 1)  # ปิดไฟแดง
-        self.set_light(0x002, 0x002, 1)  # เปิดไฟเขียว
-        self.timer.cancel()  # ยกเลิกไทม์เมอร์หลังจากทำงานครั้งแรก
-
-        # เรียก emergency_callback หลังจากไฟสีเขียวทำงานครบ 5 วินาที
-        self.timer_emergency_check = self.create_timer(5.0, self.trigger_emergency)
-
-        # สร้าง Subscription หลังจากไฟเขียวทำงาน
-        self.subscription = self.create_subscription(
-            Int32, 'monitor_topic', self.listener_callback, 10)
-        self.emergency_sub = self.create_subscription(
-            Bool, 'emergency_stop', self.emergency_callback, 10)
-
-    def trigger_emergency(self):
-        """เรียก emergency_callback พร้อมส่งค่า True"""
-        self.get_logger().info("🔄 Triggering emergency callback after green light")
-        self.timer_triggered = True  # ตั้งค่า flag เป็น True
-        msg = Bool()
-        msg.data = True
-        self.emergency_callback(msg)
-
-    def set_light(self, address, value, slave_id=1):
-        """Write a value to a Modbus register"""
-        if not self.connected:  # เพิ่มการตรวจสอบการเชื่อมต่อ
-            self.get_logger().error("❌ Device not connected")
+    # ---------- topics ----------
+    def listener_callback(self, msg: Int32):
+        self.get_logger().info(f"RX /monitor_topic: {msg.data} (emergency={self.emergency_active})")
+        if self.emergency_active:
+            self.get_logger().info("ignore because emergency active")
             return
+        v = int(msg.data)
+        if v == 1:
+            self._set_green()
+        elif v == 2:
+            self._set_yellow()
+        elif v == 3:
+            self._set_red()
+        else:
+            self.last_cmd_value = 0
+            self._all_off()
+
+    def emergency_callback(self, msg: Bool):
+        new_state = bool(msg.data)
+        self.get_logger().info(f"RX /emergency_stop: {new_state}")
+        if new_state == self.emergency_active:
+            self.get_logger().info("no change")
+            return
+
+        self.emergency_active = new_state
+        self._cancel_all_one_shots()
+
+        if self.emergency_active:
+            self.get_logger().error("🛑 EMERGENCY ACTIVATED!")
+            self._set_red(buzzer=self.buzz_on_emergency)
+        else:
+            self.get_logger().info("✅ EMERGENCY DEACTIVATED")
+            self._restore_last()
+
+    # ---------- shutdown ----------
+    def destroy_node(self):
         try:
-            response = self.client.write_register(address, value, slave=slave_id)
-            if response.isError():
-                self.get_logger().error(f"❌ Failed to set register {address:#05x}")
-        except (ModbusIOException, ConnectionException) as e:
-            self.get_logger().error(f"❌ Modbus Error: {e}")
-
-    def clear_all(self):
-        """Turn off all LEDs and Buzzer"""
-        slave_id = 1
-        for address in [0x002, 0x003, 0x004, 0x005]:
-            self.set_light(address, 0x000, slave_id)
-        self.get_logger().info("✅ All lights cleared.")
-
-    def listener_callback(self, msg):
-        if self.emergency_active:  # เพิ่มเงื่อนไขตรวจสอบ
-            return
-        self.get_logger().info(f"Received value: {msg.data}")
-        self.control_modbus(msg.data)
-
-    def emergency_callback(self, msg):
-        new_emergency_state = msg.data
-
-        # ตรวจสอบว่าเป็นการเรียกจาก timer หรือไม่ และสถานะมีการเปลี่ยนแปลงหรือไม่
-        if self.timer_triggered or new_emergency_state != self.emergency_active:
-            self.emergency_active = new_emergency_state
-            self.timer_triggered = False  # รีเซ็ต flag
-
-            if self.emergency_active:
-                self.get_logger().error("🛑 EMERGENCY ACTIVATED!")
-                self.get_logger().info(f"Emergency State: {self.emergency_active}")
-                self.clear_all()
-                self.set_light(0x004, 0x002, 1)  # ไฟแดง
-                if self.timer_emergency_check is not None:
-                    self.timer_emergency_check.cancel()
-            else:
-                self.get_logger().info("✅ EMERGENCY DEACTIVATED")
-                self.get_logger().info(f"Emergency State: {self.emergency_active}")
-                self.clear_all()
-                self.set_light(0x002, 0x002, 1)  # ไฟเขียว
-                if self.timer_emergency_check is not None:
-                    self.timer_emergency_check.cancel()  # ยกเลิก timer
-                    self.timer_emergency_check = None
-
-    def emergency_activated(self):
-        self.clear_all()
-        self.set_light(0x004, 0x002, 1)  # ไฟแดง
-        # self.set_light(0x005, 0x002, 1)  # ออด
-        self.timer_emergency.cancel()
-
-    def emergency_deactivated(self):
-        self.clear_all()
-        self.set_light(0x002, 0x002, 1)  # ไฟเขียว
-        # self.set_light(0x005, 0x002, 1)  # ออด
-        self.timer_emergency.cancel()
-
-    def control_modbus(self, value):
-        slave_id = 1
-        green_addr = 0x002
-        yellow_addr = 0x003
-        red_addr = 0x004
-        buzzer_addr = 0x005
-        color_values = 0x002
-        buzzer_values = 0x002
-
-        def write_color_and_buzzer(color_address, color_value, buzzer_value):
-            color_response = self.client.write_register(color_address, color_value, slave=slave_id)
-            buzzer_response = self.client.write_register(buzzer_addr, buzzer_value, slave=slave_id)
-
-            if color_response.isError():
-                self.get_logger().error(
-                    f"❌ Error writing to color register at {
-                        color_address:#05x}")
-            else:
-                self.get_logger().info(
-                    f"✅ Successfully wrote {color_value} to color register {
-                        color_address:#05x}")
-
-            if buzzer_response.isError():
-                self.get_logger().error("❌ Error writing to Buzzer register at 0x005")
-            else:
-                self.get_logger().info(
-                    f"✅ Successfully wrote {buzzer_value} to Buzzer register 0x005")
-
-        # Turn off the lights and buzzer first.
-        self.clear_all()
-
-        time.sleep(1.5)
-
-        # Control LED and Buzzer according to received values
-        if value == 1:
-            write_color_and_buzzer(green_addr, color_values, buzzer_values)
-        elif value == 2:
-            write_color_and_buzzer(yellow_addr, color_values, 0x000)
-        elif value == 3:
-            write_color_and_buzzer(red_addr, color_values, buzzer_values)
-        elif value == 0:
-            self.clear_all()
+            self._cancel_all_one_shots()
+            self._all_off()
+        finally:
+            super().destroy_node()
+            try:
+                self.client.close()
+            except Exception:
+                pass
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = ModbusNode()
-    rclpy.spin(node)
+    executor = MultiThreadedExecutor(num_threads=2)
+    rclpy.spin(node, executor=executor)
     node.destroy_node()
     rclpy.shutdown()
 
