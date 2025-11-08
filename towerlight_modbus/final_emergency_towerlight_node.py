@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Towerlight Modbus Node (ROS 2) — Serial RTU only
-
-- รองรับ pymodbus 3.8.x (ไม่มี method='rtu')
-- ตรวจอัตโนมัติว่าใช้ kw 'slave' หรือ 'unit'
-- Non-blocking (ไม่มี time.sleep ใน callback)
-- Reconnect อัตโนมัติ + restore ค่าสีเดิม
-- แก้บั๊ก: ปลดฉุกเฉินแล้วคืนสีเดิมก่อนเข้า EMERGENCY
-"""
 
 import threading
 import logging
 import inspect
-from typing import Optional
+import time
+from typing import Optional, List
 
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from std_msgs.msg import Int32, Bool
 
 from pymodbus.client import ModbusSerialClient
@@ -34,6 +26,9 @@ REG_BUZZ   = 0x005
 REG_ENABLE = 0x006
 VAL_ON     = 0x002
 VAL_OFF    = 0x000
+
+# ===== Coalesce window (วินาที) =====
+COALESCE_SEC = 0.03   # 30 ms รวมคำสั่งที่วิ่งมาถี่ๆ
 
 
 class ModbusNode(Node):
@@ -81,10 +76,9 @@ class ModbusNode(Node):
         self.buzz_green        = bool(p('buzzer_on_green').value)
         self.buzz_on_emergency = bool(p('buzzer_on_emergency').value)
 
-        # ===== Modbus Serial (pymodbus 3.8.x ไม่มี method='rtu') =====
         try:
             self.client = ModbusSerialClient(
-                method='rtu',  # บางรุ่นเก่าใช้ได้ แต่ใน 3.8.x จะ TypeError
+                method='rtu',
                 port=self.port, baudrate=self.baudrate, parity=self.parity,
                 stopbits=self.stopbits, bytesize=self.bytesize, timeout=self.timeout
             )
@@ -96,21 +90,40 @@ class ModbusNode(Node):
 
         # ตรวจจาก signature ว่าต้องใช้ kw 'slave' หรือ 'unit'
         self._addr_kw = self._detect_addr_kw()
+        # ตรวจว่า client รองรับ write_registers หรือไม่
+        self._has_multi = hasattr(self.client, 'write_registers')
 
         self.modbus_lock = threading.Lock()
         self.connected = False
 
-        # ===== state =====
-        self.emergency_active = False
-        self.pre_emergency_value: Optional[int] = None  # จำค่าสีก่อนเข้า EMERGENCY
-        self.last_cmd_value = 0      # 0=all off, 1=green, 2=yellow, 3=red
-        self.pending_timers = []     # one-shot timers (ยกเลิกตอน emergency)
+        # ===== state (register cache) =====
+        self._reg_cache = {
+            REG_GREEN: VAL_OFF,
+            REG_YELLOW: VAL_OFF,
+            REG_RED: VAL_OFF,
+            REG_BUZZ: VAL_OFF,
+        }
 
-        # ===== topics =====
-        self.create_subscription(Int32, 'monitor_topic', self.listener_callback, 10, callback_group=self.cb)
-        self.create_subscription(Bool,  'emergency_stop', self.emergency_callback, 10, callback_group=self.cb)
+        self.emergency_active = False
+        self.pre_emergency_value: Optional[int] = None
+        self.last_cmd_value = 0      # 0=all off, 1=green, 2=yellow, 3=red
+
+        # coalesce
+        self._pending_scene = None   # (g,y,r,b) ที่รอรวมคำสั่ง
+        self._coalesce_timer = None
+
+        # ===== topics (QoS: latest-only) =====
+        qos_latest = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(Int32, 'monitor_topic', self.listener_callback, qos_latest, callback_group=self.cb)
+        self.create_subscription(Bool,  'emergency_stop', self.emergency_callback, qos_latest, callback_group=self.cb)
 
         # ===== timers =====
+        self._poll_paused = False
         self.create_timer(self.reconnect_period, self._ensure_connection, callback_group=self.cb)
         self.create_timer(self.poll_period, self._poll_registers, callback_group=self.cb)
 
@@ -125,7 +138,7 @@ class ModbusNode(Node):
         if self.auto_emerg_delay > 0.0:
             self._arm_timer(self.auto_emerg_delay, lambda: self.emergency_callback(Bool(data=True)))
 
-        self.get_logger().info("✅ Towerlight serial node started")
+        self.get_logger().info("✅ Towerlight serial node (low-latency) started")
 
     # ---------- compat helpers ----------
     def _detect_addr_kw(self) -> str:
@@ -136,80 +149,150 @@ class ModbusNode(Node):
             return 'unit'
         return 'unit'
 
-    def _call_write(self, addr: int, val: int):
-        kw = {self._addr_kw: self.slave}
-        return self.client.write_register(addr, val, **kw)
+    def _kwaddr(self):
+        return {self._addr_kw: self.slave}
 
-    def _call_read_hr(self, address: int, count: int):
-        kw = {self._addr_kw: self.slave}
-        return self.client.read_holding_registers(address=address, count=count, **kw)
-
-    # ---------- low level (non-blocking) ----------
+    # ---------- write primitives ----------
     def _write_reg(self, addr: int, val: int) -> bool:
         if not self.connected:
             self.get_logger().warn(f"skip write 0x{addr:03X} (not connected)")
             return False
         with self.modbus_lock:
             try:
-                resp = self._call_write(addr, val)
+                resp = self.client.write_register(addr, val, **self._kwaddr())
                 ok = (resp is not None) and (not resp.isError())
                 self.get_logger().info(f"WRITE 0x{addr:03X} = {val} -> {'OK' if ok else 'ERR'}")
+                if ok:
+                    self._reg_cache[addr] = val
                 return ok
             except Exception as e:
                 self.get_logger().error(f"Modbus write error @0x{addr:03X}: {e}")
                 self.connected = False
                 return False
 
+    def _write_regs(self, start_addr: int, values: List[int]) -> bool:
+        if not self.connected:
+            self.get_logger().warn("skip multi-write (not connected)")
+            return False
+        if not self._has_multi:
+            ok_all = True
+            for i, v in enumerate(values):
+                ok_all &= self._write_reg(start_addr + i, v)
+            return ok_all
+
+        with self.modbus_lock:
+            try:
+                resp = self.client.write_registers(start_addr, values, **self._kwaddr())
+                ok = (resp is not None) and (not resp.isError())
+                self.get_logger().info(
+                    f"WRITE_MULTI 0x{start_addr:03X}..0x{start_addr+len(values)-1:03X} <- {values} -> {'OK' if ok else 'ERR'}"
+                )
+                if ok:
+                    for i, v in enumerate(values):
+                        self._reg_cache[start_addr + i] = v
+                return ok
+            except Exception as e:
+                self.get_logger().error(f"Modbus write_registers error @{start_addr:#05x}: {e}")
+                self.connected = False
+                return False
+
+    # ---------- scenes & coalesce ----------
+    def _apply_scene(self, g: int, y: int, r: int, b: int):
+        """ตั้งค่าฉากไฟแบบ diff-only + multi-write ในช่วง 0x002..0x005"""
+        # ระงับ poll ชั่วคราวเพื่อลดชนบัส
+        self._poll_paused = True
+        try:
+            target = {
+                REG_GREEN: g,
+                REG_YELLOW: y,
+                REG_RED: r,
+                REG_BUZZ: b,
+            }
+            # diff-only
+            addrs = []
+            vals = []
+            for a in (REG_GREEN, REG_YELLOW, REG_RED, REG_BUZZ):
+                if self._reg_cache.get(a, None) != target[a]:
+                    addrs.append(a)
+                    vals.append(target[a])
+
+            if not addrs:
+                return True
+
+            # ถ้าส่วนที่เปลี่ยนต่อเนื่องกันทั้งหมด -> เขียนทีเดียว
+            if min(addrs) + len(addrs) - 1 == max(addrs) and len(addrs) > 1:
+                return self._write_regs(min(addrs), vals)
+            else:
+                # กระจัดกระจาย -> เขียนทีละอัน
+                ok_all = True
+                for a, v in zip(addrs, vals):
+                    ok_all &= self._write_reg(a, v)
+                return ok_all
+        finally:
+            # ปล่อย poll หลังจบ (ดีเลย์นิดเพื่อให้อุปกรณ์สลับเสร็จ)
+            self._poll_paused = False
+
+    def _set_scene_coalesced(self, g: int, y: int, r: int, b: int):
+        """รวมคำสั่งที่วิ่งถี่ ภายใน COALESCE_SEC จะยิงแค่รอบสุดท้าย"""
+        self._pending_scene = (g, y, r, b)
+        if self._coalesce_timer is None:
+            self._coalesce_timer = self.create_timer(COALESCE_SEC, self._flush_coalesce, callback_group=self.cb)
+
+    def _flush_coalesce(self):
+        scene = self._pending_scene
+        self._pending_scene = None
+        try:
+            if scene is not None:
+                g, y, r, b = scene
+                self._apply_scene(g, y, r, b)
+        finally:
+            try:
+                self._coalesce_timer.cancel()
+            except Exception:
+                pass
+            self._coalesce_timer = None
+
+    # ---------- high level ----------
     def _enable_rtu(self) -> bool:
         return self._write_reg(REG_ENABLE, 0x001)
 
-    def _all_off(self) -> None:
+    def _all_off(self):
         self.get_logger().info("ALL OFF")
-        self._write_reg(REG_GREEN,  VAL_OFF)
-        self._write_reg(REG_YELLOW, VAL_OFF)
-        self._write_reg(REG_RED,    VAL_OFF)
-        self._write_reg(REG_BUZZ,   VAL_OFF)
+        self._set_scene_coalesced(VAL_OFF, VAL_OFF, VAL_OFF, VAL_OFF)
 
-    def _apply_buzzer(self, want: bool) -> None:
-        if self.enable_buzzer:
-            self._write_reg(REG_BUZZ, VAL_ON if want else VAL_OFF)
-
-    # --- ตั้งสี (มี flag record เพื่อไม่ทับ last_cmd ตอน EMERGENCY) ---
-    def _set_green(self, record: bool = True) -> None:
+    def _set_green(self, record: bool = True):
         if record:
             self.last_cmd_value = 1
         self.get_logger().info("SET GREEN")
-        self._all_off()
-        self._write_reg(REG_GREEN, VAL_ON)
-        self._apply_buzzer(self.buzz_green and not self.emergency_active)
+        buzz = VAL_ON if (self.enable_buzzer and self.buzz_green and not self.emergency_active) else VAL_OFF
+        self._set_scene_coalesced(VAL_ON, VAL_OFF, VAL_OFF, buzz)
 
-    def _set_yellow(self, record: bool = True) -> None:
+    def _set_yellow(self, record: bool = True):
         if record:
             self.last_cmd_value = 2
         self.get_logger().info("SET YELLOW")
-        self._all_off()
-        self._write_reg(REG_YELLOW, VAL_ON)
-        self._apply_buzzer(self.buzz_yellow and not self.emergency_active)
+        buzz = VAL_ON if (self.enable_buzzer and self.buzz_yellow and not self.emergency_active) else VAL_OFF
+        self._set_scene_coalesced(VAL_OFF, VAL_ON, VAL_OFF, buzz)
 
-    def _set_red(self, buzzer: Optional[bool] = None, record: bool = True) -> None:
+    def _set_red(self, buzzer: Optional[bool] = None, record: bool = True):
         if record:
             self.last_cmd_value = 3
         self.get_logger().info("SET RED")
-        self._all_off()
-        self._write_reg(REG_RED, VAL_ON)
         if buzzer is None:
             buzzer = self.buzz_red and not self.emergency_active
-        self._apply_buzzer(buzzer)
+        buzz = VAL_ON if (self.enable_buzzer and buzzer) else VAL_OFF
+        self._set_scene_coalesced(VAL_OFF, VAL_OFF, VAL_ON, buzz)
 
-    def _restore_last(self) -> None:
+    def _restore_last(self):
         self.get_logger().info(f"RESTORE last={self.last_cmd_value}")
         {0: self._all_off, 1: self._set_green, 2: self._set_yellow, 3: self._set_red}.get(self.last_cmd_value, self._all_off)()
 
-    def _arm_timer(self, delay_sec: float, fn) -> None:
+    # ---------- timers ----------
+    def _arm_timer(self, delay_sec: float, fn):
         t = self.create_timer(delay_sec, lambda: self._fire_one_shot(t, fn), callback_group=self.cb)
-        self.pending_timers.append(t)
+        # ไม่ต้องเก็บลิสต์ one-shots เพราะฉากเรา coalesce อยู่แล้ว
 
-    def _fire_one_shot(self, timer_obj, fn) -> None:
+    def _fire_one_shot(self, timer_obj, fn):
         try:
             fn()
         finally:
@@ -217,19 +300,9 @@ class ModbusNode(Node):
                 timer_obj.cancel()
             except Exception:
                 pass
-            if timer_obj in self.pending_timers:
-                self.pending_timers.remove(timer_obj)
-
-    def _cancel_all_one_shots(self) -> None:
-        for t in list(self.pending_timers):
-            try:
-                t.cancel()
-            except Exception:
-                pass
-        self.pending_timers.clear()
 
     # ---------- connection / polling ----------
-    def _ensure_connection(self, first_time: bool = False) -> None:
+    def _ensure_connection(self, first_time: bool = False):
         if self.connected:
             return
         try:
@@ -245,12 +318,12 @@ class ModbusNode(Node):
         elif first_time:
             self.get_logger().error("❌ Failed to connect to Modbus device (will retry)")
 
-    def _poll_registers(self) -> None:
-        if not self.connected:
+    def _poll_registers(self):
+        if self._poll_paused or not self.connected:
             return
         try:
             with self.modbus_lock:
-                resp = self._call_read_hr(address=0x000, count=4)
+                resp = self.client.read_holding_registers(address=0x000, count=4, **self._kwaddr())
             if not resp or resp.isError():
                 raise ModbusIOException("read error")
         except Exception as e:
@@ -258,7 +331,7 @@ class ModbusNode(Node):
             self.connected = False
 
     # ---------- topics ----------
-    def listener_callback(self, msg: Int32) -> None:
+    def listener_callback(self, msg: Int32):
         self.get_logger().info(f"RX /monitor_topic: {msg.data} (emergency={self.emergency_active})")
         if self.emergency_active:
             self.get_logger().info("ignore because emergency active")
@@ -271,7 +344,7 @@ class ModbusNode(Node):
             self.last_cmd_value = 0
             self._all_off()
 
-    def emergency_callback(self, msg: Bool) -> None:
+    def emergency_callback(self, msg: Bool):
         new_state = bool(msg.data)
         self.get_logger().info(f"RX /emergency_stop: {new_state}")
         if new_state == self.emergency_active:
@@ -279,27 +352,30 @@ class ModbusNode(Node):
             return
 
         self.emergency_active = new_state
-        self._cancel_all_one_shots()
 
         if self.emergency_active:
+            # เก็บสีเดิมก่อนเข้า EMERGENCY แล้วสั่งแดงโดยไม่ทับ last_cmd_value
             self.pre_emergency_value = self.last_cmd_value
             self.get_logger().error("🛑 EMERGENCY ACTIVATED!")
             self._set_red(buzzer=self.buzz_on_emergency, record=False)
         else:
             self.get_logger().info("✅ EMERGENCY DEACTIVATED")
+            # คืนค่าสีก่อนฉุกเฉิน (ถ้าไม่ทราบ ให้กลับไปเขียว)
             v = self.pre_emergency_value
             self.pre_emergency_value = None
             if   v == 1: self._set_green(record=True)
             elif v == 2: self._set_yellow(record=True)
             elif v == 3: self._set_red(record=True)
             else:        self._set_green(record=True)
-            # self._set_green(record=True)
 
     # ---------- shutdown ----------
     def destroy_node(self):
         try:
-            self._cancel_all_one_shots()
-            self._all_off()
+            # ยิงฉากล่าสุดให้ปิดทั้งหมดอย่างรวดเร็ว
+            try:
+                self._apply_scene(VAL_OFF, VAL_OFF, VAL_OFF, VAL_OFF)
+            except Exception:
+                pass
         finally:
             super().destroy_node()
             try:
