@@ -1,0 +1,23 @@
+modbus_node:
+  ros__parameters:
+    # ===== Serial =====
+    port: "/dev/towerlight"   # เช่น "/dev/ttyUSB0"
+    baudrate: 9600
+    parity: "N"               # "N", "E", "O"
+    stopbits: 1
+    bytesize: 8
+    timeout: 2.0
+    slave_id: 1
+
+    # ===== Timers =====
+    poll_period: 3.0                 # อ่าน holding registers ทุกกี่วิ
+    reconnect_period: 3.0            # ความถี่พยายามเชื่อมต่อใหม่
+    turn_green_delay: 0.0            # หลังบูต(ขึ้นไฟแดง) รอกี่วิค่อยเปิดไฟเขียว
+    emergency_auto_trigger_delay: 0.0  # 0.0 = ปิด auto-emergency
+
+    # ===== Buzzer Policy =====
+    enable_buzzer: true
+    buzzer_on_red: true
+    buzzer_on_yellow: false
+    buzzer_on_green: false
+    buzzer_on_emergency: true

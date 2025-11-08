@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),     
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,6 +29,7 @@ setup(
             'emergency_towerlight_node = towerlight_modbus.emergency_towerlight_node:main',
             'emer_and_towerlight_node = towerlight_modbus.emer_and_towerlight_node:main',
             'final_emergency_towerlight_node = towerlight_modbus.final_emergency_towerlight_node:main',
+            'modbus_node = towerlight_modbus.modbus_node:main',
         ],
     },
 )

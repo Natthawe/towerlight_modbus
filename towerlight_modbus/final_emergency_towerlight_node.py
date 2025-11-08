@@ -22,7 +22,7 @@ class ModbusNode(Node):
 
         if self.connected:
             self.enable_modbus_rtu()
-            self.timer = self.create_timer(5.0, self.turn_green)
+            self.timer = self.create_timer(150.0, self.turn_green)
             self.set_light(0x004, 0x002, 1)  # เปิดไฟแดง
         else:
             self.get_logger().error("❌ Failed to connect to Modbus device")
@@ -71,7 +71,7 @@ class ModbusNode(Node):
                 self.get_logger().info("✅ Reconnecting to Modbus device...")
                 self.enable_modbus_rtu()
                 self.set_light(0x004, 0x002, 1)  # เปิดไฟแดง
-                time.sleep(5)
+                time.sleep(160)
                 self.set_light(0x004, 0x000, 1)  # ปิดไฟแดง
                 time.sleep(0.5)
                 self.set_light(0x002, 0x002, 1)  # เปิดไฟเขียว
@@ -104,7 +104,7 @@ class ModbusNode(Node):
             self.reconnect()
 
     def turn_green(self):
-        """เปลี่ยนไฟเป็นสีเขียวหลังจาก 5 วินาที"""
+        """The light turns green after 60 seconds."""
         self.set_light(0x004, 0x000, 1)  # ปิดไฟแดง
         self.set_light(0x002, 0x002, 1)  # เปิดไฟเขียว
         self.timer.cancel()  # ยกเลิกไทม์เมอร์หลังจากทำงานครั้งแรก
@@ -224,7 +224,7 @@ class ModbusNode(Node):
         if value == 1:
             write_color_and_buzzer(green_addr, color_values, buzzer_values)
         elif value == 2:
-            write_color_and_buzzer(yellow_addr, color_values, buzzer_values)
+            write_color_and_buzzer(yellow_addr, color_values, 0x000)
         elif value == 3:
             write_color_and_buzzer(red_addr, color_values, buzzer_values)
         elif value == 0:
