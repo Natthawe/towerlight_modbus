@@ -18,25 +18,26 @@ from pymodbus.exceptions import ModbusIOException
 
 logging.getLogger('pymodbus').setLevel(logging.CRITICAL)
 
-# Registers / Values (จากคู่มือ)
+# ===== Registers / Values (ตามคู่มือ) =====
 REG_GREEN  = 0x002
 REG_YELLOW = 0x003
 REG_RED    = 0x004
 REG_BUZZ   = 0x005
 REG_ENABLE = 0x006
-VAL_ON     = 0x002
-VAL_OFF    = 0x000
 
+VAL_OFF   = 0x000
+VAL_ON    = 0x001   # ← ON (Continuous) ติดค้างไม่กระพริบ
+VAL_FLASH = 0x002   # ถ้าต้องการโหมดกระพริบค่อยใช้ค่านี้ (ตอนนี้ไม่ได้ใช้)
 
 class ModbusNode(Node):
     def __init__(self):
         super().__init__('final_emergency_towerlight_node')
         self.cb = ReentrantCallbackGroup()
 
-        # ===== parameters =====
+        # ===== Parameters =====
         self.declare_parameter('port', '/dev/towerlight')
         self.declare_parameter('baudrate', 9600)
-        self.declare_parameter('parity', 'N')
+        self.declare_parameter('parity', 'N')     # 'N','E','O'
         self.declare_parameter('stopbits', 1)
         self.declare_parameter('bytesize', 8)
         self.declare_parameter('timeout',  0.3)
@@ -52,10 +53,10 @@ class ModbusNode(Node):
         self.declare_parameter('buzzer_on_green', False)
         self.declare_parameter('buzzer_on_emergency', True)
 
-        # 🔸 ใหม่: Pulse buzzer ช่วงสั้นๆ ตอนเข้าฉุกเฉิน (ms), 0 = ไม่เปิดเลย
-        self.declare_parameter('emergency_buzzer_pulse_ms', 150)
-        # 🔸 ใหม่: ปลดฉุกเฉินแล้วบังคับ clear แดง/บัซเซอร์ก่อนเปิดเขียว
-        self.declare_parameter('force_clear_before_green', True)
+        # anti-latch options
+        self.declare_parameter('emergency_buzzer_pulse_ms', 0)   # 0 = ไม่เปิดบัซเซอร์เลย
+        self.declare_parameter('force_clear_before_green', True) # ปลดฉุกเฉินแล้วเคลียร์ก่อนเปิดเขียว
+        self.declare_parameter('force_block_write', True)        # เขียน 0x002..0x005 ทีเดียว
 
         p = self.get_parameter
         self.port       = p('port').value
@@ -76,10 +77,11 @@ class ModbusNode(Node):
         self.buzz_green        = bool(p('buzzer_on_green').value)
         self.buzz_on_emergency = bool(p('buzzer_on_emergency').value)
 
-        self.emg_buzz_pulse_ms = int(p('emergency_buzzer_pulse_ms').value)
+        self.emg_buzz_pulse_ms       = int(p('emergency_buzzer_pulse_ms').value)
         self.force_clear_before_green = bool(p('force_clear_before_green').value)
+        self.force_block_write        = bool(p('force_block_write').value)
 
-        # ===== Modbus Serial (pymodbus 3.8.x ไม่มี method='rtu') =====
+        # ===== Modbus Serial (pymodbus 3.8.x) =====
         try:
             self.client = ModbusSerialClient(
                 method='rtu',
@@ -87,12 +89,13 @@ class ModbusNode(Node):
                 stopbits=self.stopbits, bytesize=self.bytesize, timeout=self.timeout
             )
         except TypeError:
+            # บางเวอร์ชันไม่มี argument method
             self.client = ModbusSerialClient(
                 port=self.port, baudrate=self.baudrate, parity=self.parity,
                 stopbits=self.stopbits, bytesize=self.bytesize, timeout=self.timeout
             )
 
-        # addr kw: slave/unit
+        # addr keyword (slave/unit) ระวังเวอร์ชัน
         self._addr_kw = self._detect_addr_kw()
         self._has_multi = hasattr(self.client, 'write_registers')
 
@@ -105,7 +108,7 @@ class ModbusNode(Node):
         self.last_cmd_value = 0  # 0=off, 1=G, 2=Y, 3=R
         self._poll_paused = False
 
-        # cache ค่าสุดท้ายที่ตั้งไว้
+        # cache ค่าสุดท้ายที่ตั้งไว้ (ใช้ลดการเขียนซ้ำ)
         self._reg_cache = {
             REG_GREEN: VAL_OFF,
             REG_YELLOW: VAL_OFF,
@@ -113,7 +116,7 @@ class ModbusNode(Node):
             REG_BUZZ: VAL_OFF,
         }
 
-        # QoS: latest only (ทิ้งของเก่า)
+        # QoS: เก็บค่าใหม่สุด (ลด backlog เวลา pub 20 Hz)
         qos_latest = QoSProfile(
             history=HistoryPolicy.KEEP_LAST, depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -134,7 +137,7 @@ class ModbusNode(Node):
         else:
             self._set_green()
 
-        self.get_logger().info("✅ Towerlight serial node (anti-latch) started")
+        self.get_logger().info("✅ Towerlight serial node started (continuous ON mode)")
 
     # ---------- utils ----------
     def _detect_addr_kw(self) -> str:
@@ -174,6 +177,7 @@ class ModbusNode(Node):
         if not self.connected:
             self.get_logger().warn("skip write_registers (not connected)")
             return False
+        # ถ้าไม่มี write_registers ในเวอร์ชันนี้ ให้ loop ทีละตัว
         if not self._has_multi:
             ok = True
             for i, v in enumerate(values):
@@ -195,15 +199,20 @@ class ModbusNode(Node):
                 return False
 
     def _apply_scene(self, g, y, r, b):
-        """ตั้งค่าฉากแบบ diff + multi-write (ระงับ poll ชั่วคราว)"""
+        """ตั้งค่า 4 ช่อง (G,Y,R,B) ให้ตรงเป้า
+           - ถ้า force_block_write=True ⇒ เขียน 0x002..0x005 ครั้งเดียว
+           - ไม่งั้นทำ diff + contiguous optimization
+        """
         self._poll_paused = True
         try:
+            if self.force_block_write:
+                return self._write_regs(REG_GREEN, [g, y, r, b])
+
             target = {REG_GREEN:g, REG_YELLOW:y, REG_RED:r, REG_BUZZ:b}
             dirty = [a for a in (REG_GREEN, REG_YELLOW, REG_RED, REG_BUZZ)
                      if self._reg_cache.get(a) != target[a]]
             if not dirty: return True
             dirty.sort()
-            # contiguous?
             first, last = dirty[0], dirty[-1]
             if last - first + 1 == len(dirty) and len(dirty) > 1:
                 vals = [target[a] for a in range(first, last+1)]
@@ -238,9 +247,15 @@ class ModbusNode(Node):
     def _set_red(self, buzzer: Optional[bool] = None, record: bool = True):
         if record: self.last_cmd_value = 3
         self.get_logger().info("SET RED")
-        if buzzer is None: buzzer = self.buzz_red and not self.emergency_active
-        buzz = VAL_ON if (self.enable_buzzer and buzzer) else VAL_OFF
-        self._apply_scene(VAL_OFF, VAL_OFF, VAL_ON, buzz)
+        # ถ้า pulse_ms == 0 => ห้ามเปิดบัซเซอร์เด็ดขาด
+        if self.emg_buzz_pulse_ms == 0:
+            effective_buzz = False
+        else:
+            if buzzer is None:
+                buzzer = self.buzz_red and not self.emergency_active
+            effective_buzz = bool(self.enable_buzzer and buzzer)
+        buzz_val = VAL_ON if effective_buzz else VAL_OFF
+        self._apply_scene(VAL_OFF, VAL_OFF, VAL_ON, buzz_val)
 
     def _restore_last(self):
         self.get_logger().info(f"RESTORE last={self.last_cmd_value}")
@@ -272,9 +287,8 @@ class ModbusNode(Node):
 
     # ---------- topics ----------
     def listener_callback(self, msg: Int32):
-        # self.get_logger().info(f"RX /monitor_topic: {msg.data} (emergency={self.emergency_active})")
+        # อย่าทับ Emergency
         if self.emergency_active:
-            # self.get_logger().info("ignore because emergency active")
             return
         v = int(msg.data)
         if   v == 1: self._set_green(record=True)
@@ -286,9 +300,7 @@ class ModbusNode(Node):
 
     def emergency_callback(self, msg: Bool):
         new_state = bool(msg.data)
-        # self.get_logger().info(f"RX /emergency_stop: {new_state}")
         if new_state == self.emergency_active:
-            # self.get_logger().info("no change")
             return
 
         self.emergency_active = new_state
@@ -297,11 +309,10 @@ class ModbusNode(Node):
             # จำสีเดิมก่อนฉุกเฉิน
             self.pre_emergency_value = self.last_cmd_value
             self.get_logger().error("🛑 EMERGENCY ACTIVATED!")
-            # 1) ไฟแดง + บัซเซอร์ (ถ้าตั้ง)
+            # เปิดแดง; ถ้า pulse_ms == 0 จะไม่เปิดบัซเซอร์
             want_buzz = self.buzz_on_emergency and (self.emg_buzz_pulse_ms != 0)
             self._set_red(buzzer=want_buzz, record=False)
-
-            # 2) ถ้า pulse_ms > 0 ให้ตัดบัซเซอร์ทิ้งเร็ว ๆ เพื่อไม่ให้ฮาร์ดแวร์ค้างโหมด
+            # ตัดบัซเซอร์เร็ว ๆ เฉพาะกรณี pulse_ms > 0
             if want_buzz and self.emg_buzz_pulse_ms > 0:
                 self._arm_once(self.emg_buzz_pulse_ms/1000.0,
                                lambda: self._apply_scene(self._reg_cache[REG_GREEN],
@@ -310,11 +321,9 @@ class ModbusNode(Node):
                                                          VAL_OFF))
         else:
             self.get_logger().info("✅ EMERGENCY DEACTIVATED")
-            # ปลดฉุกเฉิน: (ทางเลือก) ล้างแดง/บัซเซอร์ก่อน เพื่อหลุด latch ของอุปกรณ์
             if self.force_clear_before_green:
                 self._apply_scene(VAL_OFF, VAL_OFF, VAL_OFF, VAL_OFF)
-
-            # คืนสีเดิม หรือไม่ทราบ -> เขียว
+            # คืนสีเดิม ไม่ทราบ -> เขียว
             v = self.pre_emergency_value
             self.pre_emergency_value = None
             if   v == 1: self._set_green(record=True)
