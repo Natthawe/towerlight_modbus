@@ -1,0 +1,27 @@
+modbus_node:
+  ros__parameters:
+    # ----- Serial / Modbus config -----
+    serial_port: "/dev/towerlight"
+    baudrate: 9600
+    parity: "N"       # "N", "E", "O"
+    stopbits: 1
+    bytesize: 8
+    timeout: 2.0      # วินาที
+
+    slave_id: 1       # Modbus slave ID ของ tower light
+
+    # ----- Timer period (วินาที) -----
+    reconnect_period: 3.0   # เช็คการ reconnect ทุก reconnect_period วินาที
+    read_period: 1.0        # อ่าน Modbus status ทุก ๆ read_period วินาที
+
+    # ----- ROS topics -----
+    emergency_topic: "emergency_stop"
+    monitor_topic: "monitor_topic"
+
+    # ----- พฤติกรรมเริ่มต้น -----
+    default_emergency_active: true   # เริ่มต้นถือว่า emergency = True
+    auto_green_on_clear: true        # ปลด emergency แล้วให้ไฟเขียวติด
+    clear_all_on_shutdown: true      # ตอนปิด node ให้ clear ไฟทั้งหมด
+
+    # ----- Debug -----
+    log_modbus_status: false         # ถ้า true ให้ self.read_modbus_data() พิมพ์ค่าทุกครั้ง
