@@ -1,4 +1,4 @@
-modbus_node:
+final_emergency_towerlight_node:
   ros__parameters:
     # ----- Serial / Modbus config -----
     serial_port: "/dev/towerlight"
